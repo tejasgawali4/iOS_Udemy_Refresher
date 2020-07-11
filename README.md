@@ -1,12 +1,6 @@
 # iOS_Udemy_Refresher
 iOS 13 and Swift 5.1
 
-
-iOS Development
-
-
-Xcode Keyboard Shortcuts
-
 Color Hunt : choose your favorite color
 https://colorhunt.co/
 
