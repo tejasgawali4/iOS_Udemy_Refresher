@@ -14,70 +14,46 @@
  * limitations under the License.
  */
 
-#import "FIRFirestore+Internal.h"
+#import "FIRFirestore.h"
+
+#import <FirebaseCore/FIRApp.h>
+#import <FirebaseCore/FIRAppInternal.h>
+#import <FirebaseCore/FIRComponentContainer.h>
+#import <FirebaseCore/FIRLogger.h>
+#import <FirebaseCore/FIROptions.h>
 
 #include <memory>
 #include <string>
 #include <utility>
 
-#import "FIRFirestoreSettings+Internal.h"
+#import "FIRFirestore.h"
 
-#import "FirebaseCore/Sources/Private/FirebaseCoreInternal.h"
-#import "Firestore/Source/API/FIRCollectionReference+Internal.h"
 #import "Firestore/Source/API/FIRDocumentReference+Internal.h"
-#import "Firestore/Source/API/FIRListenerRegistration+Internal.h"
-#import "Firestore/Source/API/FIRQuery+Internal.h"
-#import "Firestore/Source/API/FIRTransaction+Internal.h"
-#import "Firestore/Source/API/FIRWriteBatch+Internal.h"
+#import "Firestore/Source/API/FIRFirestore+Internal.h"
 #import "Firestore/Source/API/FSTFirestoreComponent.h"
 #import "Firestore/Source/API/FSTUserDataConverter.h"
+#import "Firestore/Source/Util/FSTUsageValidation.h"
 
-#include "Firestore/core/src/api/collection_reference.h"
-#include "Firestore/core/src/api/document_reference.h"
-#include "Firestore/core/src/api/firestore.h"
-#include "Firestore/core/src/api/write_batch.h"
-#include "Firestore/core/src/auth/credentials_provider.h"
-#include "Firestore/core/src/core/database_info.h"
-#include "Firestore/core/src/core/event_listener.h"
-#include "Firestore/core/src/core/transaction.h"
-#include "Firestore/core/src/model/database_id.h"
-#include "Firestore/core/src/util/async_queue.h"
-#include "Firestore/core/src/util/config.h"
-#include "Firestore/core/src/util/empty.h"
-#include "Firestore/core/src/util/error_apple.h"
-#include "Firestore/core/src/util/exception.h"
-#include "Firestore/core/src/util/exception_apple.h"
-#include "Firestore/core/src/util/executor_libdispatch.h"
-#include "Firestore/core/src/util/hard_assert.h"
-#include "Firestore/core/src/util/log.h"
-#include "Firestore/core/src/util/status.h"
-#include "Firestore/core/src/util/statusor.h"
-#include "Firestore/core/src/util/string_apple.h"
+#include "Firestore/core/src/firebase/firestore/api/firestore.h"
+#include "Firestore/core/src/firebase/firestore/auth/credentials_provider.h"
+#include "Firestore/core/src/firebase/firestore/core/database_info.h"
+#include "Firestore/core/src/firebase/firestore/model/database_id.h"
+#include "Firestore/core/src/firebase/firestore/util/async_queue.h"
+#include "Firestore/core/src/firebase/firestore/util/delayed_constructor.h"
+#include "Firestore/core/src/firebase/firestore/util/log.h"
+#include "Firestore/core/src/firebase/firestore/util/string_apple.h"
 
 namespace util = firebase::firestore::util;
 using firebase::firestore::api::DocumentReference;
 using firebase::firestore::api::Firestore;
-using firebase::firestore::api::ListenerRegistration;
 using firebase::firestore::auth::CredentialsProvider;
-using firebase::firestore::core::EventListener;
 using firebase::firestore::model::DatabaseId;
 using firebase::firestore::util::AsyncQueue;
-using firebase::firestore::util::Empty;
-using firebase::firestore::util::MakeCallback;
-using firebase::firestore::util::MakeNSError;
-using firebase::firestore::util::MakeNSString;
-using firebase::firestore::util::MakeString;
-using firebase::firestore::util::ObjcThrowHandler;
-using firebase::firestore::util::SetThrowHandler;
-using firebase::firestore::util::Status;
-using firebase::firestore::util::StatusOr;
-using firebase::firestore::util::ThrowIllegalState;
-using firebase::firestore::util::ThrowInvalidArgument;
-
-using UserUpdateBlock = id _Nullable (^)(FIRTransaction *, NSError **);
-using UserTransactionCompletion = void (^)(id _Nullable, NSError *_Nullable);
+using firebase::firestore::util::DelayedConstructor;
 
 NS_ASSUME_NONNULL_BEGIN
+
+extern "C" NSString *const FIRFirestoreErrorDomain = @"FIRFirestoreErrorDomain";
 
 #pragma mark - FIRFirestore
 
@@ -88,40 +64,72 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 @implementation FIRFirestore {
-  std::shared_ptr<Firestore> _firestore;
-  FIRFirestoreSettings *_settings;
-  __weak id<FSTFirestoreInstanceRegistry> _registry;
+  DelayedConstructor<Firestore> _firestore;
+}
+
++ (NSMutableDictionary<NSString *, FIRFirestore *> *)instances {
+  static dispatch_once_t token = 0;
+  static NSMutableDictionary<NSString *, FIRFirestore *> *instances;
+  dispatch_once(&token, ^{
+    instances = [NSMutableDictionary dictionary];
+  });
+  return instances;
 }
 
 + (void)initialize {
-  if (self == [FIRFirestore class]) {
-    SetThrowHandler(ObjcThrowHandler);
-  }
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  [center addObserverForName:kFIRAppDeleteNotification
+                      object:nil
+                       queue:nil
+                  usingBlock:^(NSNotification *_Nonnull note) {
+                    NSString *appName = note.userInfo[kFIRAppNameKey];
+                    if (appName == nil) return;
+
+                    NSMutableDictionary *instances = [self instances];
+                    @synchronized(instances) {
+                      // Since the key for instances isn't just the app name, iterate over all the
+                      // keys to get the one(s) we have to delete. There could be multiple in case
+                      // the user calls firestoreForApp:database:.
+                      NSMutableArray *keysToDelete = [[NSMutableArray alloc] init];
+                      NSString *keyPrefix = [NSString stringWithFormat:@"%@|", appName];
+                      for (NSString *key in instances.allKeys) {
+                        if ([key hasPrefix:keyPrefix]) {
+                          [keysToDelete addObject:key];
+                        }
+                      }
+
+                      // Loop through the keys found and delete them from the stored instances.
+                      for (NSString *key in keysToDelete) {
+                        [instances removeObjectForKey:key];
+                      }
+                    }
+                  }];
 }
 
 + (instancetype)firestore {
   FIRApp *app = [FIRApp defaultApp];
   if (!app) {
-    ThrowIllegalState("Failed to get FirebaseApp instance. Please call FirebaseApp.configure() "
-                      "before using Firestore");
+    FSTThrowInvalidUsage(@"FIRAppNotConfiguredException",
+                         @"Failed to get FirebaseApp instance. Please call FirebaseApp.configure() "
+                         @"before using Firestore");
   }
-  return [self firestoreForApp:app database:MakeNSString(DatabaseId::kDefault)];
+  return [self firestoreForApp:app database:util::WrapNSString(DatabaseId::kDefault)];
 }
 
 + (instancetype)firestoreForApp:(FIRApp *)app {
-  return [self firestoreForApp:app database:MakeNSString(DatabaseId::kDefault)];
+  return [self firestoreForApp:app database:util::WrapNSString(DatabaseId::kDefault)];
 }
 
 // TODO(b/62410906): make this public
 + (instancetype)firestoreForApp:(FIRApp *)app database:(NSString *)database {
   if (!app) {
-    ThrowInvalidArgument("FirebaseApp instance may not be nil. Use FirebaseApp.app() if you'd like "
-                         "to use the default FirebaseApp instance.");
+    FSTThrowInvalidArgument(@"FirebaseApp instance may not be nil. Use FirebaseApp.app() if you'd "
+                             "like to use the default FirebaseApp instance.");
   }
   if (!database) {
-    ThrowInvalidArgument("Database identifier may not be nil. Use '%s' if you want the default "
-                         "database",
-                         DatabaseId::kDefault);
+    FSTThrowInvalidArgument(@"database identifier may not be nil. Use '%s' if you want the default "
+                             "database",
+                            DatabaseId::kDefault);
   }
 
   id<FSTFirestoreMultiDBProvider> provider =
@@ -129,23 +137,21 @@ NS_ASSUME_NONNULL_BEGIN
   return [provider firestoreForDatabase:database];
 }
 
-- (instancetype)initWithDatabaseID:(model::DatabaseId)databaseID
-                    persistenceKey:(std::string)persistenceKey
-               credentialsProvider:(std::shared_ptr<CredentialsProvider>)credentialsProvider
-                       workerQueue:(std::shared_ptr<AsyncQueue>)workerQueue
-                       firebaseApp:(FIRApp *)app
-                  instanceRegistry:(nullable id<FSTFirestoreInstanceRegistry>)registry {
+- (instancetype)initWithProjectID:(std::string)projectID
+                         database:(std::string)database
+                   persistenceKey:(std::string)persistenceKey
+              credentialsProvider:(std::unique_ptr<CredentialsProvider>)credentialsProvider
+                      workerQueue:(std::unique_ptr<AsyncQueue>)workerQueue
+                      firebaseApp:(FIRApp *)app {
   if (self = [super init]) {
-    _firestore = std::make_shared<Firestore>(std::move(databaseID), std::move(persistenceKey),
-                                             std::move(credentialsProvider), std::move(workerQueue),
-                                             (__bridge void *)self);
+    _firestore.Init(std::move(projectID), std::move(database), std::move(persistenceKey),
+                    std::move(credentialsProvider), std::move(workerQueue), (__bridge void *)self);
 
     _app = app;
-    _registry = registry;
 
     FSTPreConverterBlock block = ^id _Nullable(id _Nullable input) {
       if ([input isKindOfClass:[FIRDocumentReference class]]) {
-        auto documentReference = (FIRDocumentReference *)input;
+        FIRDocumentReference *documentReference = (FIRDocumentReference *)input;
         return [[FSTDocumentKeyReference alloc] initWithKey:documentReference.key
                                                  databaseID:documentReference.firestore.databaseID];
       } else {
@@ -153,162 +159,68 @@ NS_ASSUME_NONNULL_BEGIN
       }
     };
 
-    _dataConverter = [[FSTUserDataConverter alloc] initWithDatabaseID:_firestore->database_id()
+    _dataConverter = [[FSTUserDataConverter alloc] initWithDatabaseID:&_firestore->database_id()
                                                          preConverter:block];
-    // Use the property setter so the default settings get plumbed into _firestoreClient.
-    self.settings = [[FIRFirestoreSettings alloc] init];
   }
   return self;
 }
 
 - (FIRFirestoreSettings *)settings {
-  // Disallow mutation of our internal settings
-  return [_settings copy];
+  return _firestore->settings();
 }
 
 - (void)setSettings:(FIRFirestoreSettings *)settings {
-  if (![settings isEqual:_settings]) {
-    _settings = settings;
-    _firestore->set_settings([settings internalSettings]);
+  _firestore->set_settings(settings);
+}
 
-#if HAVE_LIBDISPATCH
-    std::unique_ptr<util::Executor> user_executor =
-        absl::make_unique<util::ExecutorLibdispatch>(settings.dispatchQueue);
-#else
-    // It's possible to build without libdispatch on macOS for testing purposes.
-    // In this case, avoid breaking the build.
-    std::unique_ptr<util::Executor> user_executor =
-        util::Executor::CreateSerial("com.google.firebase.firestore.user");
-#endif  // HAVE_LIBDISPATCH
-
-    _firestore->set_user_executor(std::move(user_executor));
-  }
+/**
+ * Ensures that the FirestoreClient is configured and returns it.
+ */
+- (FSTFirestoreClient *)client {
+  return _firestore->client();
 }
 
 - (FIRCollectionReference *)collectionWithPath:(NSString *)collectionPath {
   if (!collectionPath) {
-    ThrowInvalidArgument("Collection path cannot be nil.");
+    FSTThrowInvalidArgument(@"Collection path cannot be nil.");
   }
   if ([collectionPath containsString:@"//"]) {
-    ThrowInvalidArgument("Invalid path (%s). Paths must not contain // in them.", collectionPath);
+    FSTThrowInvalidArgument(@"Invalid path (%@). Paths must not contain // in them.",
+                            collectionPath);
   }
 
-  return [[FIRCollectionReference alloc]
-      initWithReference:_firestore->GetCollection(MakeString(collectionPath))];
+  return _firestore->GetCollection(util::MakeString(collectionPath));
 }
 
 - (FIRDocumentReference *)documentWithPath:(NSString *)documentPath {
   if (!documentPath) {
-    ThrowInvalidArgument("Document path cannot be nil.");
+    FSTThrowInvalidArgument(@"Document path cannot be nil.");
   }
   if ([documentPath containsString:@"//"]) {
-    ThrowInvalidArgument("Invalid path (%s). Paths must not contain // in them.", documentPath);
+    FSTThrowInvalidArgument(@"Invalid path (%@). Paths must not contain // in them.", documentPath);
   }
 
-  DocumentReference documentReference = _firestore->GetDocument(MakeString(documentPath));
+  DocumentReference documentReference = _firestore->GetDocument(util::MakeString(documentPath));
   return [[FIRDocumentReference alloc] initWithReference:std::move(documentReference)];
 }
 
-- (FIRQuery *)collectionGroupWithID:(NSString *)collectionID {
-  if (!collectionID) {
-    ThrowInvalidArgument("Collection ID cannot be nil.");
-  }
-  if ([collectionID containsString:@"/"]) {
-    ThrowInvalidArgument("Invalid collection ID (%s). Collection IDs must not contain / in them.",
-                         collectionID);
-  }
-
-  auto query = _firestore->GetCollectionGroup(MakeString(collectionID));
-  return [[FIRQuery alloc] initWithQuery:std::move(query) firestore:_firestore];
-}
-
 - (FIRWriteBatch *)batch {
-  return [FIRWriteBatch writeBatchWithDataConverter:self.dataConverter
-                                         writeBatch:_firestore->GetBatch()];
+  return _firestore->GetBatch();
 }
 
-- (void)runTransactionWithBlock:(UserUpdateBlock)updateBlock
+- (void)runTransactionWithBlock:(id _Nullable (^)(FIRTransaction *, NSError **))updateBlock
                   dispatchQueue:(dispatch_queue_t)queue
-                     completion:(UserTransactionCompletion)completion {
+                     completion:
+                         (void (^)(id _Nullable result, NSError *_Nullable error))completion {
+  // We wrap the function they provide in order to use internal implementation classes for
+  // transaction, and to run the user callback block on the proper queue.
   if (!updateBlock) {
-    ThrowInvalidArgument("Transaction block cannot be nil.");
+    FSTThrowInvalidArgument(@"Transaction block cannot be nil.");
+  } else if (!completion) {
+    FSTThrowInvalidArgument(@"Transaction completion block cannot be nil.");
   }
-  if (!completion) {
-    ThrowInvalidArgument("Transaction completion block cannot be nil.");
-  }
 
-  class TransactionResult {
-   public:
-    TransactionResult(FIRFirestore *firestore,
-                      UserUpdateBlock update_block,
-                      dispatch_queue_t queue,
-                      UserTransactionCompletion completion)
-        : firestore_(firestore),
-          user_update_block_(update_block),
-          queue_(queue),
-          user_completion_(completion) {
-    }
-
-    void RunUpdateBlock(std::shared_ptr<core::Transaction> internalTransaction,
-                        core::TransactionResultCallback internalCallback) {
-      dispatch_async(queue_, ^{
-        auto transaction = [FIRTransaction transactionWithInternalTransaction:internalTransaction
-                                                                    firestore:firestore_];
-
-        NSError *_Nullable error = nil;
-        user_result_ = user_update_block_(transaction, &error);
-
-        // If the user set an error, disregard the result.
-        if (error) {
-          // If the error is a user error, set flag to not retry the transaction.
-          if (error.domain != FIRFirestoreErrorDomain) {
-            internalTransaction->MarkPermanentlyFailed();
-          }
-          internalCallback(Status::FromNSError(error));
-        } else {
-          internalCallback(Status::OK());
-        }
-      });
-    }
-
-    void HandleFinalStatus(const Status &status) {
-      if (!status.ok()) {
-        user_completion_(nil, MakeNSError(status));
-        return;
-      }
-
-      user_completion_(user_result_, nil);
-    }
-
-   private:
-    FIRFirestore *firestore_;
-    UserUpdateBlock user_update_block_;
-    dispatch_queue_t queue_;
-    UserTransactionCompletion user_completion_;
-
-    id _Nullable user_result_;
-  };
-
-  auto result_capture = std::make_shared<TransactionResult>(self, updateBlock, queue, completion);
-
-  // Wrap the user-supplied updateBlock in a core C++ compatible callback. Wrap the result of the
-  // updateBlock invocation up in a TransactionResult for tunneling through the internals of the
-  // system.
-  auto internalUpdateBlock = [result_capture](
-                                 std::shared_ptr<core::Transaction> internalTransaction,
-                                 core::TransactionResultCallback internalCallback) {
-    result_capture->RunUpdateBlock(internalTransaction, internalCallback);
-  };
-
-  // Unpacks the TransactionResult value and calls the user completion handler.
-  //
-  // PORTING NOTE: Other platforms where the user return value is internally representable don't
-  // need this wrapper.
-  auto objcTranslator = [result_capture](const Status &status) {
-    result_capture->HandleFinalStatus(status);
-  };
-
-  _firestore->RunTransaction(std::move(internalUpdateBlock), std::move(objcTranslator));
+  _firestore->RunTransaction(updateBlock, queue, completion);
 }
 
 - (void)runTransactionWithBlock:(id _Nullable (^)(FIRTransaction *, NSError **error))updateBlock
@@ -326,64 +238,55 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 + (void)enableLogging:(BOOL)logging {
-  util::LogSetLevel(logging ? util::kLogLevelDebug : util::kLogLevelNotice);
+  FIRSetLoggerLevel(logging ? FIRLoggerLevelDebug : FIRLoggerLevelNotice);
 }
 
 - (void)enableNetworkWithCompletion:(nullable void (^)(NSError *_Nullable error))completion {
-  _firestore->EnableNetwork(MakeCallback(completion));
+  _firestore->EnableNetwork(completion);
 }
 
 - (void)disableNetworkWithCompletion:(nullable void (^)(NSError *_Nullable))completion {
-  _firestore->DisableNetwork(MakeCallback(completion));
-}
-
-- (void)clearPersistenceWithCompletion:(nullable void (^)(NSError *_Nullable error))completion {
-  _firestore->ClearPersistence(MakeCallback(completion));
-}
-
-- (void)waitForPendingWritesWithCompletion:(void (^)(NSError *_Nullable error))completion {
-  _firestore->WaitForPendingWrites(MakeCallback(completion));
-}
-
-- (void)terminateWithCompletion:(nullable void (^)(NSError *_Nullable error))completion {
-  id<FSTFirestoreInstanceRegistry> strongRegistry = _registry;
-  if (strongRegistry) {
-    [strongRegistry
-        removeInstanceWithDatabase:MakeNSString(_firestore->database_id().database_id())];
-  }
-  [self terminateInternalWithCompletion:completion];
-}
-
-- (id<FIRListenerRegistration>)addSnapshotsInSyncListener:(void (^)(void))listener {
-  std::unique_ptr<core::EventListener<Empty>> eventListener =
-      core::EventListener<Empty>::Create([listener](const StatusOr<Empty> &) { listener(); });
-  std::unique_ptr<ListenerRegistration> result =
-      _firestore->AddSnapshotsInSyncListener(std::move(eventListener));
-  return [[FSTListenerRegistration alloc] initWithRegistration:std::move(result)];
+  _firestore->DisableNetwork(completion);
 }
 
 @end
 
 @implementation FIRFirestore (Internal)
 
-- (std::shared_ptr<Firestore>)wrapped {
-  return _firestore;
+- (Firestore *)wrapped {
+  return _firestore.get();
 }
 
-- (const std::shared_ptr<util::AsyncQueue> &)workerQueue {
+- (AsyncQueue *)workerQueue {
   return _firestore->worker_queue();
 }
 
-- (const DatabaseId &)databaseID {
-  return _firestore->database_id();
+- (const DatabaseId *)databaseID {
+  return &_firestore->database_id();
 }
 
-+ (FIRFirestore *)recoverFromFirestore:(std::shared_ptr<Firestore>)firestore {
++ (BOOL)isLoggingEnabled {
+  return FIRIsLoggableLevel(FIRLoggerLevelDebug, NO);
+}
+
++ (FIRFirestore *)recoverFromFirestore:(Firestore *)firestore {
   return (__bridge FIRFirestore *)firestore->extension();
 }
 
-- (void)terminateInternalWithCompletion:(nullable void (^)(NSError *_Nullable error))completion {
-  _firestore->Terminate(MakeCallback(completion));
+- (FIRQuery *)collectionGroupWithID:(NSString *)collectionID {
+  if (!collectionID) {
+    FSTThrowInvalidArgument(@"Collection ID cannot be nil.");
+  }
+  if ([collectionID containsString:@"/"]) {
+    FSTThrowInvalidArgument(
+        @"Invalid collection ID (%@). Collection IDs must not contain / in them.", collectionID);
+  }
+
+  return _firestore->GetCollectionGroup(collectionID);
+}
+
+- (void)shutdownWithCompletion:(nullable void (^)(NSError *_Nullable error))completion {
+  _firestore->Shutdown(completion);
 }
 
 @end

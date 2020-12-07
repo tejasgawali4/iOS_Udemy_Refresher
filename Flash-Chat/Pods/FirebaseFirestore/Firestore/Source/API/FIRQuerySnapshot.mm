@@ -24,22 +24,18 @@
 #import "Firestore/Source/API/FIRFirestore+Internal.h"
 #import "Firestore/Source/API/FIRQuery+Internal.h"
 #import "Firestore/Source/API/FIRSnapshotMetadata+Internal.h"
+#import "Firestore/Source/Core/FSTQuery.h"
+#import "Firestore/Source/Model/FSTDocument.h"
+#import "Firestore/Source/Util/FSTUsageValidation.h"
 
-#include "Firestore/core/src/api/query_core.h"
-#include "Firestore/core/src/api/query_snapshot.h"
-#include "Firestore/core/src/core/view_snapshot.h"
-#include "Firestore/core/src/model/document_set.h"
-#include "Firestore/core/src/util/delayed_constructor.h"
-#include "Firestore/core/src/util/exception.h"
+#include "Firestore/core/src/firebase/firestore/core/view_snapshot.h"
+#include "Firestore/core/src/firebase/firestore/model/document_set.h"
+#include "Firestore/core/src/firebase/firestore/util/delayed_constructor.h"
 
-using firebase::firestore::api::DocumentChange;
-using firebase::firestore::api::DocumentSnapshot;
 using firebase::firestore::api::Firestore;
 using firebase::firestore::api::QuerySnapshot;
-using firebase::firestore::api::SnapshotMetadata;
 using firebase::firestore::core::ViewSnapshot;
 using firebase::firestore::util::DelayedConstructor;
-using firebase::firestore::util::ThrowInvalidArgument;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -63,11 +59,11 @@ NS_ASSUME_NONNULL_BEGIN
   return self;
 }
 
-- (instancetype)initWithFirestore:(std::shared_ptr<Firestore>)firestore
-                    originalQuery:(core::Query)query
+- (instancetype)initWithFirestore:(Firestore *)firestore
+                    originalQuery:(FSTQuery *)query
                          snapshot:(ViewSnapshot &&)snapshot
                          metadata:(SnapshotMetadata)metadata {
-  QuerySnapshot wrapped(firestore, std::move(query), std::move(snapshot), std::move(metadata));
+  QuerySnapshot wrapped(firestore, query, std::move(snapshot), std::move(metadata));
   return [self initWithSnapshot:std::move(wrapped)];
 }
 
@@ -84,7 +80,8 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 - (FIRQuery *)query {
-  return [[FIRQuery alloc] initWithQuery:_snapshot->query()];
+  FIRFirestore *firestore = [FIRFirestore recoverFromFirestore:_snapshot->firestore()];
+  return [FIRQuery referenceWithQuery:_snapshot->internal_query() firestore:firestore];
 }
 
 - (FIRSnapshotMetadata *)metadata {
@@ -125,15 +122,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (NSArray<FIRDocumentChange *> *)documentChangesWithIncludeMetadataChanges:
     (BOOL)includeMetadataChanges {
-  if (!_documentChanges || _documentChangesIncludeMetadataChanges != includeMetadataChanges) {
-    NSMutableArray *documentChanges = [NSMutableArray array];
-    _snapshot->ForEachChange(
-        static_cast<bool>(includeMetadataChanges), [&documentChanges](DocumentChange change) {
-          [documentChanges
-              addObject:[[FIRDocumentChange alloc] initWithDocumentChange:std::move(change)]];
-        });
+  if (includeMetadataChanges && _snapshot->view_snapshot().excludes_metadata_changes()) {
+    FSTThrowInvalidArgument(
+        @"To include metadata changes with your document changes, you must call "
+        @"addSnapshotListener(includeMetadataChanges: true).");
+  }
 
-    _documentChanges = documentChanges;
+  if (!_documentChanges || _documentChangesIncludeMetadataChanges != includeMetadataChanges) {
+    _documentChanges = [FIRDocumentChange documentChangesForSnapshot:_snapshot->view_snapshot()
+                                              includeMetadataChanges:includeMetadataChanges
+                                                           firestore:_snapshot->firestore()];
     _documentChangesIncludeMetadataChanges = includeMetadataChanges;
   }
   return _documentChanges;

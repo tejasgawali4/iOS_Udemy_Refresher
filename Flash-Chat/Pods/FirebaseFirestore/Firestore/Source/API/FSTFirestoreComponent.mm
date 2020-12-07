@@ -16,32 +16,35 @@
 
 #import "Firestore/Source/API/FSTFirestoreComponent.h"
 
+#import <FirebaseAuthInterop/FIRAuthInterop.h>
+#import <FirebaseCore/FIRAppInternal.h>
+#import <FirebaseCore/FIRComponent.h>
+#import <FirebaseCore/FIRComponentContainer.h>
+#import <FirebaseCore/FIRDependency.h>
+#import <FirebaseCore/FIRLibrary.h>
+#import <FirebaseCore/FIROptions.h>
+
 #include <memory>
 #include <string>
 #include <utility>
 
-#import "FirebaseCore/Sources/Private/FirebaseCoreInternal.h"
 #import "Firestore/Source/API/FIRFirestore+Internal.h"
-#import "Interop/Auth/Public/FIRAuthInterop.h"
-
+#import "Firestore/Source/Util/FSTUsageValidation.h"
 #include "Firestore/core/include/firebase/firestore/firestore_version.h"
-#include "Firestore/core/src/api/firestore.h"
-#include "Firestore/core/src/auth/credentials_provider.h"
-#include "Firestore/core/src/auth/firebase_credentials_provider_apple.h"
-#include "Firestore/core/src/model/maybe_document.h"
-#include "Firestore/core/src/util/async_queue.h"
-#include "Firestore/core/src/util/exception.h"
-#include "Firestore/core/src/util/executor.h"
-#include "Firestore/core/src/util/hard_assert.h"
+#include "Firestore/core/src/firebase/firestore/api/firestore.h"
+#include "Firestore/core/src/firebase/firestore/auth/credentials_provider.h"
+#include "Firestore/core/src/firebase/firestore/auth/firebase_credentials_provider_apple.h"
+#include "Firestore/core/src/firebase/firestore/util/async_queue.h"
+#include "Firestore/core/src/firebase/firestore/util/executor_libdispatch.h"
+#include "Firestore/core/src/firebase/firestore/util/hard_assert.h"
 #include "absl/memory/memory.h"
 
 namespace util = firebase::firestore::util;
 using firebase::firestore::api::Firestore;
 using firebase::firestore::auth::CredentialsProvider;
 using firebase::firestore::auth::FirebaseCredentialsProvider;
-using firebase::firestore::util::AsyncQueue;
-using firebase::firestore::util::Executor;
-using firebase::firestore::util::ThrowInvalidArgument;
+using util::AsyncQueue;
+using util::ExecutorLibdispatch;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -66,23 +69,14 @@ NS_ASSUME_NONNULL_BEGIN
   return self;
 }
 
-- (NSString *)keyForDatabase:(NSString *)database {
-  return [NSString stringWithFormat:@"%@|%@", self.app.name, database];
-}
-
 #pragma mark - FSTInstanceProvider Conformance
 
 - (FIRFirestore *)firestoreForDatabase:(NSString *)database {
   if (!database) {
-    ThrowInvalidArgument("Database identifier may not be nil.");
+    FSTThrowInvalidArgument(@"database identifier may not be nil.");
   }
 
-  NSString *projectID = self.app.options.projectID;
-  if (!projectID) {
-    ThrowInvalidArgument("FIROptions.projectID must be set to a valid project ID.");
-  }
-
-  NSString *key = [self keyForDatabase:database];
+  NSString *key = [NSString stringWithFormat:@"%@|%@", self.app.name, database];
 
   // Get the component from the container.
   @synchronized(self.instances) {
@@ -93,44 +87,33 @@ NS_ASSUME_NONNULL_BEGIN
         absl::StrAppend(&queue_name, ".", util::MakeString(self.app.name));
       }
 
-      auto executor = Executor::CreateSerial(queue_name.c_str());
-      auto workerQueue = AsyncQueue::Create(std::move(executor));
+      auto executor = absl::make_unique<ExecutorLibdispatch>(
+          dispatch_queue_create(queue_name.c_str(), DISPATCH_QUEUE_SERIAL));
+      auto workerQueue = absl::make_unique<AsyncQueue>(std::move(executor));
 
       id<FIRAuthInterop> auth = FIR_COMPONENT(FIRAuthInterop, self.app.container);
-      auto credentialsProvider = std::make_shared<FirebaseCredentialsProvider>(self.app, auth);
+      auto credentialsProvider = absl::make_unique<FirebaseCredentialsProvider>(self.app, auth);
 
-      model::DatabaseId databaseID{util::MakeString(projectID), util::MakeString(database)};
+      std::string projectID = util::MakeString(self.app.options.projectID);
       std::string persistenceKey = util::MakeString(self.app.name);
-      firestore = [[FIRFirestore alloc] initWithDatabaseID:std::move(databaseID)
-                                            persistenceKey:std::move(persistenceKey)
-                                       credentialsProvider:std::move(credentialsProvider)
-                                               workerQueue:std::move(workerQueue)
-                                               firebaseApp:self.app
-                                          instanceRegistry:self];
+      firestore = [[FIRFirestore alloc] initWithProjectID:std::move(projectID)
+                                                 database:util::MakeString(database)
+                                           persistenceKey:std::move(persistenceKey)
+                                      credentialsProvider:std::move(credentialsProvider)
+                                              workerQueue:std::move(workerQueue)
+                                              firebaseApp:self.app];
       _instances[key] = firestore;
     }
-    return firestore;
-  }
-}
 
-- (void)removeInstanceWithDatabase:(NSString *)database {
-  @synchronized(_instances) {
-    NSString *key = [self keyForDatabase:database];
-    [_instances removeObjectForKey:key];
+    return firestore;
   }
 }
 
 #pragma mark - FIRComponentLifecycleMaintainer
 
-- (void)appWillBeDeleted:(__unused FIRApp *)app {
-  NSDictionary<NSString *, FIRFirestore *> *instances;
-  @synchronized(_instances) {
-    instances = [_instances copy];
-    [_instances removeAllObjects];
-  }
-  for (NSString *key in instances) {
-    [instances[key] terminateInternalWithCompletion:nil];
-  }
+- (void)appWillBeDeleted:(FIRApp *)app {
+  // Stop any actions and clean up resources since instances of Firestore associated with this app
+  // will be removed. Currently does not do anything.
 }
 
 #pragma mark - Object Lifecycle

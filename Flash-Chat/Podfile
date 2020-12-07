@@ -6,8 +6,9 @@ use_frameworks!
 target 'Flash Chat iOS13' do
 
       
-    pod 'Firebase/Core'
-    pod 'Firebase/Auth'
-    pod 'Firebase/Firestore'
+    pod 'Firebase/Core' , '~> 5.0'
+    pod 'Firebase/Auth' , '~> 5.0'
+    pod 'Firebase/Firestore' , '~> 5.0'
+    pod 'SKActivityIndicatorView', '~> 1.0.0'
 
 end

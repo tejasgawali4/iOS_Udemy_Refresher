@@ -16,9 +16,10 @@
  *
  */
 
-#include <grpcpp/impl/codegen/server_context_impl.h>
+#include <grpcpp/server_context.h>
 
 #include <algorithm>
+#include <mutex>
 #include <utility>
 
 #include <grpc/compression.h>
@@ -26,28 +27,22 @@
 #include <grpc/load_reporting.h>
 #include <grpc/support/alloc.h>
 #include <grpc/support/log.h>
+#include <grpcpp/completion_queue.h>
 #include <grpcpp/impl/call.h>
-#include <grpcpp/impl/codegen/completion_queue_impl.h>
-#include <grpcpp/support/server_callback.h>
 #include <grpcpp/support/time.h>
 
-#include "src/core/lib/gprpp/ref_counted.h"
-#include "src/core/lib/gprpp/sync.h"
 #include "src/core/lib/surface/call.h"
 
-namespace grpc_impl {
+namespace grpc {
 
 // CompletionOp
 
-class ServerContextBase::CompletionOp final
-    : public ::grpc::internal::CallOpSetInterface {
+class ServerContext::CompletionOp final : public internal::CallOpSetInterface {
  public:
   // initial refs: one in the server context, one in the cq
   // must ref the call before calling constructor and after deleting this
-  CompletionOp(::grpc::internal::Call* call,
-               ::grpc_impl::internal::ServerCallbackCall* callback_controller)
+  CompletionOp(internal::Call* call)
       : call_(*call),
-        callback_controller_(callback_controller),
         has_tag_(false),
         tag_(nullptr),
         core_cq_tag_(this),
@@ -68,15 +63,12 @@ class ServerContextBase::CompletionOp final
     }
   }
 
-  void FillOps(::grpc::internal::Call* call) override;
+  void FillOps(internal::Call* call) override;
 
   // This should always be arena allocated in the call, so override delete.
   // But this class is not trivially destructible, so must actually call delete
   // before allowing the arena to be freed
-  static void operator delete(void* /*ptr*/, std::size_t size) {
-    // Use size to avoid unused-parameter warning since assert seems to be
-    // compiled out and treated as unused in some gcc optimized versions.
-    (void)size;
+  static void operator delete(void* ptr, std::size_t size) {
     assert(size == sizeof(CompletionOp));
   }
 
@@ -110,7 +102,7 @@ class ServerContextBase::CompletionOp final
   // RPC. This should set hijacking state for each of the ops.
   void SetHijackingState() override {
     /* Servers don't allow hijacking */
-    GPR_ASSERT(false);
+    GPR_CODEGEN_ASSERT(false);
   }
 
   /* Should be called after interceptors are done running */
@@ -122,42 +114,50 @@ class ServerContextBase::CompletionOp final
     done_intercepting_ = true;
     if (!has_tag_) {
       /* We don't have a tag to return. */
-      Unref();
+      std::unique_lock<std::mutex> lock(mu_);
+      if (--refs_ == 0) {
+        lock.unlock();
+        grpc_call* call = call_.call();
+        delete this;
+        grpc_call_unref(call);
+      }
       return;
     }
     /* Start a dummy op so that we can return the tag */
-    GPR_ASSERT(grpc_call_start_batch(call_.call(), nullptr, 0, core_cq_tag_,
-                                     nullptr) == GRPC_CALL_OK);
+    GPR_CODEGEN_ASSERT(GRPC_CALL_OK ==
+                       g_core_codegen_interface->grpc_call_start_batch(
+                           call_.call(), nullptr, 0, this, nullptr));
   }
 
  private:
   bool CheckCancelledNoPluck() {
-    grpc_core::MutexLock lock(&mu_);
+    std::lock_guard<std::mutex> g(mu_);
     return finalized_ ? (cancelled_ != 0) : false;
   }
 
-  ::grpc::internal::Call call_;
-  ::grpc_impl::internal::ServerCallbackCall* const callback_controller_;
+  internal::Call call_;
   bool has_tag_;
   void* tag_;
   void* core_cq_tag_;
-  grpc_core::RefCount refs_;
-  grpc_core::Mutex mu_;
+  std::mutex mu_;
+  int refs_;
   bool finalized_;
-  int cancelled_;  // This is an int (not bool) because it is passed to core
+  int cancelled_;
   bool done_intercepting_;
-  ::grpc::internal::InterceptorBatchMethodsImpl interceptor_methods_;
+  internal::InterceptorBatchMethodsImpl interceptor_methods_;
 };
 
-void ServerContextBase::CompletionOp::Unref() {
-  if (refs_.Unref()) {
+void ServerContext::CompletionOp::Unref() {
+  std::unique_lock<std::mutex> lock(mu_);
+  if (--refs_ == 0) {
+    lock.unlock();
     grpc_call* call = call_.call();
     delete this;
     grpc_call_unref(call);
   }
 }
 
-void ServerContextBase::CompletionOp::FillOps(::grpc::internal::Call* call) {
+void ServerContext::CompletionOp::FillOps(internal::Call* call) {
   grpc_op ops;
   ops.op = GRPC_OP_RECV_CLOSE_ON_SERVER;
   ops.data.recv_close_on_server.cancelled = &cancelled_;
@@ -166,72 +166,66 @@ void ServerContextBase::CompletionOp::FillOps(::grpc::internal::Call* call) {
   interceptor_methods_.SetCall(&call_);
   interceptor_methods_.SetReverse();
   interceptor_methods_.SetCallOpSetInterface(this);
-  // The following call_start_batch is internally-generated so no need for an
-  // explanatory log on failure.
-  GPR_ASSERT(grpc_call_start_batch(call->call(), &ops, 1, core_cq_tag_,
-                                   nullptr) == GRPC_CALL_OK);
+  GPR_ASSERT(GRPC_CALL_OK == grpc_call_start_batch(call->call(), &ops, 1,
+                                                   core_cq_tag_, nullptr));
   /* No interceptors to run here */
 }
 
-bool ServerContextBase::CompletionOp::FinalizeResult(void** tag, bool* status) {
+bool ServerContext::CompletionOp::FinalizeResult(void** tag, bool* status) {
   bool ret = false;
-  grpc_core::ReleasableMutexLock lock(&mu_);
+  std::unique_lock<std::mutex> lock(mu_);
   if (done_intercepting_) {
     /* We are done intercepting. */
     if (has_tag_) {
       *tag = tag_;
       ret = true;
     }
-    Unref();
+    if (--refs_ == 0) {
+      lock.unlock();
+      grpc_call* call = call_.call();
+      delete this;
+      grpc_call_unref(call);
+    }
     return ret;
   }
   finalized_ = true;
 
-  // If for some reason the incoming status is false, mark that as a
-  // cancellation.
-  // TODO(vjpai): does this ever happen?
-  if (!*status) {
-    cancelled_ = 1;
-  }
-
-  // Decide whether to call the cancel callback before releasing the lock
-  bool call_cancel = (cancelled_ != 0);
-
-  // Release the lock since we may call a callback and interceptors now.
-  lock.Unlock();
-
-  if (call_cancel && callback_controller_ != nullptr) {
-    callback_controller_->MaybeCallOnCancel();
-  }
+  if (!*status) cancelled_ = 1;
+  /* Release the lock since we are going to be running through interceptors now
+   */
+  lock.unlock();
   /* Add interception point and run through interceptors */
   interceptor_methods_.AddInterceptionHookPoint(
-      ::grpc::experimental::InterceptionHookPoints::POST_RECV_CLOSE);
+      experimental::InterceptionHookPoints::POST_RECV_CLOSE);
   if (interceptor_methods_.RunInterceptors()) {
     /* No interceptors were run */
     if (has_tag_) {
       *tag = tag_;
       ret = true;
     }
-    Unref();
+    lock.lock();
+    if (--refs_ == 0) {
+      lock.unlock();
+      grpc_call* call = call_.call();
+      delete this;
+      grpc_call_unref(call);
+    }
     return ret;
   }
   /* There are interceptors to be run. Return false for now */
   return false;
 }
 
-// ServerContextBase body
+// ServerContext body
 
-ServerContextBase::ServerContextBase() {
-  Setup(gpr_inf_future(GPR_CLOCK_REALTIME));
-}
+ServerContext::ServerContext() { Setup(gpr_inf_future(GPR_CLOCK_REALTIME)); }
 
-ServerContextBase::ServerContextBase(gpr_timespec deadline,
-                                     grpc_metadata_array* arr) {
+ServerContext::ServerContext(gpr_timespec deadline, grpc_metadata_array* arr) {
   Setup(deadline);
   std::swap(*client_metadata_.arr(), *arr);
 }
 
-void ServerContextBase::Setup(gpr_timespec deadline) {
+void ServerContext::Setup(gpr_timespec deadline) {
   completion_op_ = nullptr;
   has_notify_when_done_tag_ = false;
   async_notify_when_done_tag_ = nullptr;
@@ -244,43 +238,34 @@ void ServerContextBase::Setup(gpr_timespec deadline) {
   rpc_info_ = nullptr;
 }
 
-void ServerContextBase::BindDeadlineAndMetadata(gpr_timespec deadline,
-                                                grpc_metadata_array* arr) {
+void ServerContext::BindDeadlineAndMetadata(gpr_timespec deadline,
+                                            grpc_metadata_array* arr) {
   deadline_ = deadline;
   std::swap(*client_metadata_.arr(), *arr);
 }
 
-ServerContextBase::~ServerContextBase() { Clear(); }
+ServerContext::~ServerContext() { Clear(); }
 
-void ServerContextBase::Clear() {
+void ServerContext::Clear() {
   auth_context_.reset();
   initial_metadata_.clear();
   trailing_metadata_.clear();
   client_metadata_.Reset();
+  if (call_) {
+    grpc_call_unref(call_);
+  }
   if (completion_op_) {
     completion_op_->Unref();
-    completion_op_ = nullptr;
     completion_tag_.Clear();
   }
   if (rpc_info_) {
     rpc_info_->Unref();
-    rpc_info_ = nullptr;
   }
-  if (call_) {
-    auto* call = call_;
-    call_ = nullptr;
-    grpc_call_unref(call);
-  }
-  if (default_reactor_used_.load(std::memory_order_relaxed)) {
-    reinterpret_cast<Reactor*>(&default_reactor_)->~Reactor();
-    default_reactor_used_.store(false, std::memory_order_relaxed);
-  }
-  test_unary_.reset();
+  // Don't need to clear out call_, completion_op_, or rpc_info_ because this is
+  // either called from destructor or just before Setup
 }
 
-void ServerContextBase::BeginCompletionOp(
-    ::grpc::internal::Call* call, std::function<void(bool)> callback,
-    ::grpc_impl::internal::ServerCallbackCall* callback_controller) {
+void ServerContext::BeginCompletionOp(internal::Call* call, bool callback) {
   GPR_ASSERT(!completion_op_);
   if (rpc_info_) {
     rpc_info_->Ref();
@@ -288,34 +273,32 @@ void ServerContextBase::BeginCompletionOp(
   grpc_call_ref(call->call());
   completion_op_ =
       new (grpc_call_arena_alloc(call->call(), sizeof(CompletionOp)))
-          CompletionOp(call, callback_controller);
-  if (callback_controller != nullptr) {
-    completion_tag_.Set(call->call(), std::move(callback), completion_op_,
-                        true);
+          CompletionOp(call);
+  if (callback) {
+    completion_tag_.Set(call->call(), nullptr, completion_op_);
     completion_op_->set_core_cq_tag(&completion_tag_);
-    completion_op_->set_tag(completion_op_);
   } else if (has_notify_when_done_tag_) {
     completion_op_->set_tag(async_notify_when_done_tag_);
   }
   call->PerformOps(completion_op_);
 }
 
-::grpc::internal::CompletionQueueTag* ServerContextBase::GetCompletionOpTag() {
-  return static_cast<::grpc::internal::CompletionQueueTag*>(completion_op_);
+internal::CompletionQueueTag* ServerContext::GetCompletionOpTag() {
+  return static_cast<internal::CompletionQueueTag*>(completion_op_);
 }
 
-void ServerContextBase::AddInitialMetadata(const grpc::string& key,
-                                           const grpc::string& value) {
+void ServerContext::AddInitialMetadata(const grpc::string& key,
+                                       const grpc::string& value) {
   initial_metadata_.insert(std::make_pair(key, value));
 }
 
-void ServerContextBase::AddTrailingMetadata(const grpc::string& key,
-                                            const grpc::string& value) {
+void ServerContext::AddTrailingMetadata(const grpc::string& key,
+                                        const grpc::string& value) {
   trailing_metadata_.insert(std::make_pair(key, value));
 }
 
-void ServerContextBase::TryCancel() const {
-  ::grpc::internal::CancelInterceptorBatchMethods cancel_methods;
+void ServerContext::TryCancel() const {
+  internal::CancelInterceptorBatchMethods cancel_methods;
   if (rpc_info_) {
     for (size_t i = 0; i < rpc_info_->interceptors_.size(); i++) {
       rpc_info_->RunInterceptor(&cancel_methods, i);
@@ -328,7 +311,7 @@ void ServerContextBase::TryCancel() const {
   }
 }
 
-bool ServerContextBase::IsCancelled() const {
+bool ServerContext::IsCancelled() const {
   if (completion_tag_) {
     // When using callback API, this result is always valid.
     return completion_op_->CheckCancelledAsync();
@@ -342,7 +325,7 @@ bool ServerContextBase::IsCancelled() const {
   }
 }
 
-void ServerContextBase::set_compression_algorithm(
+void ServerContext::set_compression_algorithm(
     grpc_compression_algorithm algorithm) {
   compression_algorithm_ = algorithm;
   const char* algorithm_name = nullptr;
@@ -355,7 +338,7 @@ void ServerContextBase::set_compression_algorithm(
   AddInitialMetadata(GRPC_COMPRESSION_REQUEST_ALGORITHM_MD_KEY, algorithm_name);
 }
 
-grpc::string ServerContextBase::peer() const {
+grpc::string ServerContext::peer() const {
   grpc::string peer;
   if (call_) {
     char* c_peer = grpc_call_get_peer(call_);
@@ -365,11 +348,11 @@ grpc::string ServerContextBase::peer() const {
   return peer;
 }
 
-const struct census_context* ServerContextBase::census_context() const {
+const struct census_context* ServerContext::census_context() const {
   return grpc_census_call_get_context(call_);
 }
 
-void ServerContextBase::SetLoadReportingCosts(
+void ServerContext::SetLoadReportingCosts(
     const std::vector<grpc::string>& cost_data) {
   if (call_ == nullptr) return;
   for (const auto& cost_datum : cost_data) {
@@ -377,4 +360,4 @@ void ServerContextBase::SetLoadReportingCosts(
   }
 }
 
-}  // namespace grpc_impl
+}  // namespace grpc

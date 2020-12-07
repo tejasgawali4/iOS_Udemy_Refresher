@@ -19,12 +19,13 @@
 #ifndef GRPC_INTERNAL_CPP_THREAD_MANAGER_H
 #define GRPC_INTERNAL_CPP_THREAD_MANAGER_H
 
+#include <condition_variable>
 #include <list>
 #include <memory>
+#include <mutex>
 
 #include <grpcpp/support/config.h>
 
-#include "src/core/lib/gprpp/sync.h"
 #include "src/core/lib/gprpp/thd.h"
 #include "src/core/lib/iomgr/resource_quota.h"
 
@@ -54,7 +55,7 @@ class ThreadManager {
   //    DoWork()
   //
   // If the return value is SHUTDOWN:,
-  //  - ThreadManager WILL NOT call DoWork() and terminates the thread
+  //  - ThreadManager WILL NOT call DoWork() and terminates the thead
   //
   // If the return value is TIMEOUT:,
   //  - ThreadManager WILL NOT call DoWork()
@@ -122,9 +123,6 @@ class ThreadManager {
     WorkerThread(ThreadManager* thd_mgr);
     ~WorkerThread();
 
-    bool created() const { return created_; }
-    void Start() { thd_.Start(); }
-
    private:
     // Calls thd_mgr_->MainWorkLoop() and once that completes, calls
     // thd_mgr_>MarkAsCompleted(this) to mark the thread as completed
@@ -132,10 +130,9 @@ class ThreadManager {
 
     ThreadManager* const thd_mgr_;
     grpc_core::Thread thd_;
-    bool created_;
   };
 
-  // The main function in ThreadManager
+  // The main funtion in ThreadManager
   void MainWorkLoop();
 
   void MarkAsCompleted(WorkerThread* thd);
@@ -143,16 +140,16 @@ class ThreadManager {
 
   // Protects shutdown_, num_pollers_, num_threads_ and
   // max_active_threads_sofar_
-  grpc_core::Mutex mu_;
+  std::mutex mu_;
 
   bool shutdown_;
-  grpc_core::CondVar shutdown_cv_;
+  std::condition_variable shutdown_cv_;
 
   // The resource user object to use when requesting quota to create threads
   //
   // Note: The user of this ThreadManager object must create grpc_resource_quota
   // object (that contains the actual max thread quota) and a grpc_resource_user
-  // object through which quota is requested whenever new threads need to be
+  // object through which quota is requested whenver new threads need to be
   // created
   grpc_resource_user* resource_user_;
 
@@ -172,7 +169,7 @@ class ThreadManager {
   // ever set so far
   int max_active_threads_sofar_;
 
-  grpc_core::Mutex list_mu_;
+  std::mutex list_mu_;
   std::list<WorkerThread*> completed_threads_;
 };
 
