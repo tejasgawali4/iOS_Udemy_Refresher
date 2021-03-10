@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>FirebaseAppDelegateProxyEnabled</key>
+	<false/>
+	<key>CLIENT_ID</key>
+	<string>856177160133-38r2c863lkt508laasljbal2ue3jl9rr.apps.googleusercontent.com</string>
+	<key>REVERSED_CLIENT_ID</key>
+	<string>com.googleusercontent.apps.856177160133-38r2c863lkt508laasljbal2ue3jl9rr</string>
+	<key>API_KEY</key>
+	<string>AIzaSyATi4LrkIuYIgQqXXtxlASbsHLKsjq3v9E</string>
+	<key>GCM_SENDER_ID</key>
+	<string>856177160133</string>
+	<key>PLIST_VERSION</key>
+	<string>1</string>
+	<key>BUNDLE_ID</key>
+	<string>synepush.com.synechron</string>
+	<key>PROJECT_ID</key>
+	<string>reactnativedemos-de869</string>
+	<key>STORAGE_BUCKET</key>
+	<string>reactnativedemos-de869.appspot.com</string>
+	<key>IS_ADS_ENABLED</key>
+	<false/>
+	<key>IS_ANALYTICS_ENABLED</key>
+	<false/>
+	<key>IS_APPINVITE_ENABLED</key>
+	<true/>
+	<key>IS_GCM_ENABLED</key>
+	<true/>
+	<key>IS_SIGNIN_ENABLED</key>
+	<true/>
+	<key>GOOGLE_APP_ID</key>
+	<string>1:856177160133:ios:ba07b07dd325ee16c165ac</string>
+	<key>DATABASE_URL</key>
+	<string>https://reactnativedemos-de869.firebaseio.com</string>
+</dict>
+</plist>
